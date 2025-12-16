@@ -1,0 +1,48 @@
+#!/system/bin/sh
+# 校验 settings.ini 语法
+if ! /system/bin/sh -n /data/adb/clash/settings.ini 2>"/data/adb/clash/run/settings_err.log"; then
+  echo "错误: settings.ini 文件存在语法错误" | tee -a "/data/adb/clash/run/settings_err.log"
+  exit 1
+fi
+
+# 常用路径变量定义
+scripts_dir="${0%/*}"                           # 当前脚本目录
+service_path="${scripts_dir}/box.service"       # 服务脚本路径
+iptables_path="${scripts_dir}/box.iptables"     # iptables 脚本路径
+data_box="/data/adb/clash"                      # box 主目录
+run_path="/data/adb/clash/run"                  # 日志目录
+file_settings="/data/adb/clash/settings.ini"    # 配置文件路径
+now=$(date +"%H:%M")                            # 当前时间（时:分）
+
+# 获取传入参数
+events="$1"          # 事件类型（d=目录变化，n=文件变化）
+monitor_dir="$2"     # 监控目录路径
+monitor_file="$3"    # 监控文件名
+
+# 服务控制：根据事件启停服务
+service_control() {
+  # 仅响应 disable 文件变化
+  if [ "${monitor_file}" = "disable" ]; then
+    if [ "${events}" = "d" ]; then
+      # 目录变化→启动服务+启用iptables
+      "${service_path}" start > "${run_path}/inotify.log" 2>&1 &&
+      "${iptables_path}" enable >> "${run_path}/inotify.log" 2>&1
+    elif [ "${events}" = "n" ]; then
+      # 文件变化→禁用iptables+停止服务
+      "${iptables_path}" disable >> "${run_path}/inotify.log" 2>&1 &&
+      "${service_path}" stop >> "${run_path}/inotify.log" 2>&1
+    fi
+  fi
+}
+
+# 创建日志目录
+mkdir -p "${run_path}"
+
+# 检查配置文件有效性
+if [ -f "${file_settings}" ] && [ -r "${file_settings}" ] && [ -s "${file_settings}" ]; then
+  service_control  # 执行服务控制
+else
+  # 记录配置文件错误
+  echo "${now} [错误] 文件 /data/adb/clash/settings.ini 未找到" > "${run_path}/inotify_report.log"
+  exit 1
+fi

@@ -1,0 +1,228 @@
+#!/system/bin/sh
+# 校验 settings.ini 语法
+if ! /system/bin/sh -n /data/adb/clash/settings.ini 2>"/data/adb/clash/run/settings_err.log"; then
+  echo "错误: settings.ini 包含语法错误" | tee -a "/data/adb/clash/run/settings_err.log"
+  exit 1
+fi
+
+scripts_dir="${0%/*}"
+source /data/adb/clash/settings.ini
+
+# Tun 模式必需参数
+pref="100"
+ipv6="false" # 可在 settings.ini 中修改
+clash_dns_forward="enable"
+
+# 安卓11+适配：iptables 锁定等待时间
+buildVersion=$(getprop ro.build.version.release)
+minBuildVersion="11"
+IPV="iptables"
+IP6V="ip6tables"
+buildVersionMajor=${buildVersion%%.*}
+if [ "$buildVersionMajor" -ge "$minBuildVersion" ]; then
+  IPV="iptables -w 100"
+  IP6V="ip6tables -w 100"
+fi
+
+# 仅支持 clash/mihomo 核心
+if [ "${bin_name}" != "clash" ] && [ "${bin_name}" != "mihomo" ]; then
+  echo "错误: 仅支持 clash/mihomo 核心"
+  exit 1
+fi
+
+# 从 config.yaml 读取 Tun 核心配置
+clash_mode=$(busybox awk '!/^ *#/ && /mode: / { print $2;found=1; exit } END{ if(!found) print "rules" }' "${clash_config}" 2>/dev/null)
+clash_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2;found=1; exit } END{ if(!found) print "fake-ip" }' "${clash_config}" 2>/dev/null)
+fake_ip_range=$(busybox awk '!/^ *#/ && /fake-ip-range:/ { print $2; found=1; exit } END { if (!found) print "198.18.0.1/16" }' "${clash_config}" 2>/dev/null)
+tun_device=$(busybox awk '!/^ *#/ && /device: / { print $2;found=1; exit } END{ if(!found) print "meta" }' "${clash_config}" 2>/dev/null)
+
+# 输出调试日志
+box_etc() {
+  log info "增强模式: $clash_enhanced_mode, 虚拟IP范围: $fake_ip_range, 运行模式: $clash_mode"
+  log Info "TUN 设备: ($tun_device)"
+}
+
+# 检测核心进程存活状态
+bin_alive() {
+  local PID=$(<"${box_pid}" 2>/dev/null)
+  if ! kill -0 "$PID" >/dev/null; then
+    log Error "$(<"${box_run}/${bin_name}.log")"
+    log Error "${bin_name} 服务未运行"
+    log Error "请检查 ${bin_name}.log 获取更多信息"
+    log Error "终止陈旧进程 PID $PID"
+    killall -15 "${bin_name}" >/dev/null 2>&1 || busybox pkill -15 "${bin_name}" >/dev/null 2>&1
+    cleanup_iptables
+    [ -f "${box_pid}" ] && rm -f "${box_pid}"
+    return 1
+  else
+    return 0
+  fi
+}
+
+# 探测核心运行用户组
+probe_user_group() {
+  if PID=$(busybox pidof ${bin_name}) ; then
+    box_user=$(stat -c %U /proc/$PID)
+    box_group=$(stat -c %G /proc/$PID)
+    return 0
+  else
+    IFS=':' read -r box_user box_group <<< "${box_user_group}"
+    return 1
+  fi
+}
+
+# 禁用 IPv6
+disable_ipv6() {
+  sysctl -w net.ipv4.ip_forward=1
+  sysctl -w net.ipv6.conf.all.forwarding=0
+  sysctl -w net.ipv6.conf.all.accept_ra=0
+  sysctl -w net.ipv6.conf.wlan0.accept_ra=0
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1
+  sysctl -w net.ipv6.conf.default.disable_ipv6=1
+  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=1
+  ip -6 rule add unreachable pref "${pref}"
+} >/dev/null 2>&1
+
+# 启用 IPv6
+ipv6_enable() {
+  sysctl -w net.ipv4.ip_forward=1
+  sysctl -w net.ipv6.conf.all.forwarding=1
+  sysctl -w net.ipv6.conf.all.accept_ra=2
+  sysctl -w net.ipv6.conf.wlan0.accept_ra=2
+  sysctl -w net.ipv6.conf.all.disable_ipv6=0
+  sysctl -w net.ipv6.conf.default.disable_ipv6=0
+  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=0
+  ip -6 rule del unreachable pref "${pref}"
+  $IP6V -A OUTPUT -p udp --destination-port 53 -j DROP
+} >/dev/null 2>&1
+
+# 内网网段列表（绕过内网流量）
+intranet=(
+  0.0.0.0/8
+  10.0.0.0/8
+  100.64.0.0/10
+  127.0.0.0/8
+  169.254.0.0/16
+  172.16.0.0/12
+  192.0.0.0/24
+  192.0.2.0/24
+  192.88.99.0/24
+  192.168.0.0/16
+  198.51.100.0/24
+  203.0.113.0/24
+  224.0.0.0/4
+  240.0.0.0/4
+  255.0.0.0/4
+  255.255.255.0/24
+  255.255.255.255/32
+)
+intranet+=($(ip -4 a | busybox awk '/inet/ {print $2}' | busybox grep -vE "^127.0.0.1"))
+
+intranet6=(
+  ::/128
+  ::1/128
+  ::ffff:0:0/96
+  100::/64
+  64:ff9b::/96
+  2001::/32
+  2001:10::/28
+  2001:20::/28
+  2001:db8::/32
+  2002::/16
+  fc00::/7
+  fe80::/10
+  ff00::/8
+)
+intranet6+=($(ip -6 a | busybox awk '/inet6/ {print $2}' | busybox grep -vE "^fe80|^::1|^fd00"))
+
+# 检测 Tun 设备是否存在
+probe_tun_device() {
+  busybox ifconfig | grep -q "${tun_device}" || return 1
+}
+
+# Tun 模式流量转发规则
+forward() {
+  local action=$1
+  ${iptables} "${action}" FORWARD -i "${tun_device}" -j ACCEPT
+  ${iptables} "${action}" FORWARD -o "${tun_device}" -j ACCEPT
+  sysctl -w net.ipv4.ip_forward=1
+  sysctl -w net.ipv4.conf.default.rp_filter=2
+  sysctl -w net.ipv4.conf.all.rp_filter=2
+} >/dev/null 2>&1
+
+# 清理 Tun 相关 iptables 规则
+cleanup_iptables() {
+  for iptables in "$IPV" "$IP6V"; do
+    iptables="${iptables}" && forward -D >/dev/null 2>&1
+    if [ "${iptables}" = "$IP6V" ]; then
+      ${iptables} -D OUTPUT -p udp --destination-port 53 -j DROP >/dev/null 2>&1
+    fi
+  done
+}
+
+# 主命令逻辑（仅支持 Tun 模式）
+case "$1" in
+  enable|renew)
+    box_etc
+    log Info "$IPV + $IP6V"
+    probe_user_group || {
+      log Error "检查 BOX 用户组失败。请确保 ${bin_name} 内核已启动"
+    }
+
+    cleanup_iptables
+    probe_tun_device || log Error "tun 设备: (${tun_device}) 未找到"
+    [ $1 = "renew" ] && log Warning "清理 tun 规则"
+    iptables="$IPV"
+
+    # 应用转发规则
+    if forward -I; then
+      log Info "创建 iptables tun 规则完成"
+    else
+      log Error "创建 iptables tun 规则失败"
+      forward -D >/dev/null 2>&1
+    fi
+
+    # 处理 IPv6 开关
+    if [ "${ipv6}" = "true" ]; then
+      log Debug "使用 IPv6"
+      ipv6_enable
+      iptables="$IP6V"
+      if forward -I; then
+        log Info "创建 ip6tables tun 规则完成"
+      else
+        log Error "创建 ip6tables tun 规则失败"
+        forward -D >/dev/null 2>&1
+      fi
+    else
+      disable_ipv6
+      log info "禁用 IPv6"
+    fi
+
+    [ $1 = "renew" ] && log Info "重启 iptables tun 规则完成"
+    bin_alive && log Info "${bin_name} 已连接"
+    ;;
+  disable)
+    ipv6_enable
+    probe_user_group || log Error "检查 BOX 用户组失败。请确保 ${bin_name} 内核已启动"
+    log info "清理 tun 规则"
+
+    cleanup_iptables
+
+    log info "清理 tun 规则完成"
+    ;;
+  help|-h|--help|"")
+    echo "用法: $0 {enable|disable|renew}"
+    echo
+    echo "命令:"
+    echo "  enable   - 启用 Tun 模式 iptables 规则"
+    echo "  disable  - 禁用 Tun 模式并清理规则"
+    echo "  renew    - 重新应用 Tun 模式规则"
+    echo
+    echo "示例:"
+    echo "  $0 enable"
+    ;;
+  *)
+    echo "$0: '$1' 未找到"
+    echo "运行 '$0 help' 查看用法"
+    ;;
+esac

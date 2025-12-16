@@ -1,0 +1,152 @@
+#!/system/bin/sh
+# 校验 settings.ini 语法
+if ! /system/bin/sh -n /data/adb/clash/settings.ini 2>"/data/adb/clash/run/settings_err.log"; then
+  echo "错误: settings.ini 包含语法错误" | tee -a "/data/adb/clash/run/settings_err.log"
+  exit 1
+fi
+
+# 导出工具路径
+export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/data/data/com.termux/files/usr/bin"
+
+# 定义核心路径
+module_dir="/data/adb/modules/ClashForRoot"
+base_dir="/data/adb/clash"
+variab_dir="${base_dir}/run/variab"
+log_file="${base_dir}/run/netswitch.log"
+temp_log_file="/data/local/tmp/debug.log.tmp"
+last_check_file="${variab_dir}/last_check_time"
+last_wifi_state_file="${variab_dir}/last_wifi_state"
+
+# 创建变量存储目录
+[ ! -d "$variab_dir" ] && mkdir -p "$variab_dir"
+
+# 获取脚本路径
+scripts=$(realpath "$0")
+scripts_dir=$(dirname "${scripts}")
+
+# 仅响应网络变化事件（events="w"）
+events=$1
+[ "$events" != "w" ] && return
+
+# 加载配置和工具函数
+source "${base_dir}/settings.ini"
+[ "$enable_network_service_control" != "true" ] && exit 0  # 未启用网络控制则退出
+source "${scripts_dir}/ctr.utils"
+
+# 日志记录
+log_msg() {
+  [ "$inotify_log_enabled" = "true" ] && {
+    [ -z "$1" ] && echo "" >> "$log_file" || echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$log_file"
+  }
+}
+
+# 清理24小时前的旧日志
+clean_old_logs() {
+  local cutoff_time=$(( $(date +%s) - 86400 ))
+  local cutoff_str=$(date -d "@${cutoff_time}" '+%Y-%m-%d %H:%M:%S')
+  [ -f "$log_file" ] && {
+    busybox awk -v cutoff="$cutoff_str" '
+      !/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ {print; next}
+      substr($0, 1, 19) >= cutoff {print}
+    ' "$log_file" > "$temp_log_file" && mv "$temp_log_file" "$log_file"
+  }
+}
+clean_old_logs
+
+# 稳定性控制：3秒内不重复触发
+current_time=$(date +%s)
+last_check_time=$(cat "$last_check_file" 2>/dev/null || echo 0)
+time_diff=$((current_time - last_check_time))
+[ "$time_diff" -lt 3 ] && { log_msg "跳过检查: ${time_diff}s 在稳定窗口内"; return; }
+echo "$current_time" > "$last_check_file"  # 更新上次检查时间
+
+# 获取网络状态
+wifi_status=$(is_wifi_connected)
+ssid=$(get_current_ssid)
+
+# 获取wlan0 IPv4地址
+get_current_ip() {
+  for i in {1..3}; do
+    local ip=$(ip addr show wlan0 | grep 'inet ' | busybox awk '{print $2}' | cut -d/ -f1)
+    [ -n "$ip" ] && echo "$ip" && return
+    sleep 2
+  done
+  echo ""
+}
+
+# 核心逻辑：根据WiFi状态控制Clash服务
+check_module_service() {
+  # 获取当前服务状态
+  current_state=$([ -f "$box_pid" ] && echo "已启用" || echo "已禁用")
+  # 读取上次WiFi状态
+  last_ssid=$(grep 'ssid:' "$last_wifi_state_file" 2>/dev/null | cut -d: -f2)
+  last_ip=$(grep 'ip:' "$last_wifi_state_file" 2>/dev/null | cut -d: -f2)
+
+  if [ "$wifi_status" = "wifi" ] && [ -n "$ssid" ]; then
+    current_ip=$(get_current_ip)
+    if [ -n "$current_ip" ]; then
+      log_msg "网络变更: WiFi已连接"
+      log_msg "SSID: ${ssid}, IP: ${current_ip}"
+      echo -e "ssid:${ssid}\nip:${current_ip}" > "$last_wifi_state_file"
+
+      if [ "$use_module_on_wifi" = "false" ]; then
+        # WiFi下禁用服务
+        log_msg "策略: WiFi下禁用服务"
+        [ "$current_state" != "已禁用" ] && {
+          "${scripts_dir}/box.iptables" disable
+          "${scripts_dir}/box.service" stop
+          log_msg "操作: 服务已停止"
+        } || log_msg "状态: 服务已停止"
+      else
+        # 启用SSID匹配
+        if [ "$use_ssid_matching" = "true" ]; then
+          case "$use_wifi_list_mode" in
+            blacklist)
+              log_msg "策略: WiFi黑名单模式 (${wifi_ssids_list[*]})"
+              if is_allowed_wifi "$ssid" "${ssid_list}"; then
+                log_msg "结果: ${ssid} 在黑名单中"
+                [ "$current_state" != "已禁用" ] && { "${scripts_dir}/box.iptables" disable; "${scripts_dir}/box.service" stop; log_msg "操作: 服务已停止"; } || log_msg "状态: 服务已停止"
+              else
+                log_msg "结果: ${ssid} 不在黑名单中"
+                [ "$current_state" != "已启用" ] && { "${scripts_dir}/box.service" start; "${scripts_dir}/box.iptables" enable; log_msg "操作: 服务已启动"; } || log_msg "状态: 服务运行中"
+              fi
+              ;;
+            whitelist)
+              log_msg "策略: WiFi白名单模式 (${wifi_ssids_list[*]})"
+              if is_allowed_wifi "$ssid" "${ssid_list}"; then
+                log_msg "结果: ${ssid} 在白名单中"
+                [ "$current_state" != "已启用" ] && { "${scripts_dir}/box.service" start; "${scripts_dir}/box.iptables" enable; log_msg "操作: 服务已启动"; } || log_msg "状态: 服务运行中"
+              else
+                log_msg "结果: ${ssid} 不在白名单中"
+                [ "$current_state" != "已禁用" ] && { "${scripts_dir}/box.iptables" disable; "${scripts_dir}/box.service" stop; log_msg "操作: 服务已停止"; } || log_msg "状态: 服务已停止"
+              fi
+              ;;
+            *)
+              log_msg "警告: 未知模式，默认启动服务"
+              [ "$current_state" != "已启用" ] && { "${scripts_dir}/box.service" start; "${scripts_dir}/box.iptables" enable; log_msg "操作: 服务已启动"; } || log_msg "状态: 服务运行中"
+              ;;
+          esac
+        else
+          # 默认：WiFi下启动服务
+          log_msg "策略: WiFi下默认启动服务"
+          [ "$current_state" != "已启用" ] && { "${scripts_dir}/box.service" start; "${scripts_dir}/box.iptables" enable; log_msg "操作: 服务已启动"; } || log_msg "状态: 服务运行中"
+        fi
+      fi
+    else
+      log_msg "网络变更: WiFi连接中，无有效IP，跳过操作"
+    fi
+  elif [ "$wifi_status" = "not_wifi" ]; then
+    # WiFi断开时的策略
+    log_msg "网络变更: WiFi已断开"
+    if [ "$use_module_on_wifi_disconnect" = "true" ]; then
+      log_msg "策略: WiFi断开时启动服务"
+      [ "$current_state" != "已启用" ] && { "${scripts_dir}/box.service" start; "${scripts_dir}/box.iptables" enable; log_msg "操作: 服务已启动"; } || log_msg "状态: 服务运行中"
+    else
+      log_msg "策略: WiFi断开时禁用服务"
+      [ "$current_state" != "已禁用" ] && { "${scripts_dir}/box.iptables" disable; "${scripts_dir}/box.service" stop; log_msg "操作: 服务已停止"; } || log_msg "状态: 服务已停止"
+    fi
+  fi
+}
+
+# 执行服务控制逻辑
+check_module_service

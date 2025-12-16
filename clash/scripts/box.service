@@ -1,0 +1,564 @@
+#!/system/bin/sh
+# 校验 settings.ini 语法
+if ! /system/bin/sh -n /data/adb/clash/settings.ini 2>"/data/adb/clash/run/settings_err.log"; then
+  echo "Err: settings.ini 包含语法错误" | tee -a "/data/adb/clash/run/settings_err.log"
+  exit 1
+fi
+
+scripts_dir="${0%/*}"
+source /data/adb/clash/settings.ini
+
+# 模块描述文件路径
+PROPFILE="/data/adb/modules/ClashForRoot/module.prop"
+log_backup="false"  # 关闭日志备份
+
+# 清理日志文件
+box_check_logs() {
+    log info "清理日志文件"
+    find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.list" -o -name "*.inotify.log" \) -exec rm -f {} +
+    find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.bak" \) -mtime +1 -exec rm -f {} +
+}
+
+# 检查核心进程是否存活，未运行则终止陈旧进程并退出
+box_bin_alive() {
+  local PID=$(<"${box_pid}" 2>/dev/null)
+  if ! kill -0 "$PID" >/dev/null; then
+    log Error "$(<"${box_run}/${bin_name}.log")"
+    log Error "${bin_name} 服务未运行"
+    log Error "请检查 ${bin_name}.log 获取更多信息"
+    log Error "正在终止陈旧进程 $PID"
+    for bin in "${bin_list[@]}"; do
+      killall -15 "${bin}" >/dev/null || busybox pkill -15 "${bin}" >/dev/null 2>&1 
+    done
+    "${scripts_dir}/box.iptables" disable >/dev/null 2>&1
+    [ -f "${box_pid}" ] && rm -f "${box_pid}"
+    exit 1
+  else
+    return 0
+  fi
+}
+
+# 配置并启动定时任务
+box_run_crontab() {
+  pkill -f "busybox crond" >/dev/null 2>&1
+  busybox crontab -c "${box_run}" -r
+  echo "# root 的定时任务" > "${box_run}/root"
+
+  if [ "${run_crontab}" = "true" ]; then
+    log Debug "crond 已启用"
+    if [ "$update_subscription" = "true" ] || [ "$update_geo" = "true" ]; then
+      if [ -n "${interva_update}" ]; then
+        log Debug "Crontab 间隔: ${interva_update}"
+        echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run}/root"
+        log info "${bin_name} geox 更新: ${update_geo}"
+        log info "${bin_name} 订阅更新: ${update_subscription}"
+      else
+        log Debug "Crontab 间隔为空，跳过"
+      fi
+    fi
+    cat "${box_dir}/crontab.cfg" >> "${box_run}/root"
+    chmod 0644 "${box_run}/root"
+    nohup busybox crond -c "${box_run}" >/dev/null 2>&1 &
+  else
+    log info "crond 已禁用"
+  fi
+}
+
+# 设置 clash 内核链接
+xclash() {
+  local xclash_option="${xclash_option:-mihomo}"
+  current_clash="$(readlink "${bin_dir}/clash")"
+
+  if [ "$current_clash" != "${bin_dir}/xclash/${xclash_option}" ]; then
+    if [ -f "${bin_dir}/xclash/${xclash_option}" ]; then
+      if ! ln -sf "${bin_dir}/xclash/${xclash_option}" "${bin_dir}/clash"; then
+        log Error "无法使用 ${xclash_option}"
+        return 1
+      fi
+    else
+      mkdir -p "${bin_dir}/xclash"
+      log Error "未找到 ${bin_dir}/xclash/${xclash_option}"
+      return 1
+    fi
+  fi
+  log info "clash设置完成"
+  return 0
+}
+
+# 设置文件所有权和权限
+box_ownership() {
+  chown -R ${box_user_group} ${box_dir}
+  chmod -R 644 ${box_dir}/${bin_name}
+  chown ${box_user_group} ${bin_path}
+  chmod 6755 ${bin_path}
+  chmod 0700 ${box_dir}/bin/yq
+  chmod 0700 ${box_dir}/bin/curl
+}
+
+# 校验用户组和内核文件权限
+box_permission() {
+  if [[ "${box_user_group}" == @(root:net_admin|0:3005) && -f "${bin_path}" ]]; then
+    box_ownership
+    log info "使用内核: ${bin_path}"
+  else
+    if  [[ "${box_user_group}" != @(root:net_admin|0:3005) ]]; then
+      log Error "不支持的用户组: $box_user_group"
+      sed -i "s/box_user_group=.*/box_user_group=\"root:net_admin\"/g" ${settings}
+      log Debug "已自动改为 root:net_admin，请重启"
+      exit 1
+    fi
+    log Error "缺少内核: ${bin_name}"
+    log Error "请放置内核到 ${bin_dir}/"
+    log Debug "执行 'su -c /data/adb/clash/scripts/box.tool upkernel' 下载"
+    exit 1
+  fi
+}
+
+# 校验内核文件是否可执行并获取版本
+box_check_bin() {
+  if [ ! -x "${bin_path}" ]; then
+    log Error "${bin_path} 不可执行"
+    exit 1
+  fi
+
+  local version_output
+  version_output=$("${bin_path}" -v 2>/dev/null) || {
+    log Error "无法获取 ${bin_name} 版本"
+    exit 1
+  }
+
+  log info "${version_output}"
+}
+
+# 准备 clash 配置
+prepare_clash() {
+  if ! [ -f "${clash_config}" ]; then
+    log Error "未找到配置文件: ${clash_config}"
+    exit 1
+  else
+    log info "找到配置文件: ${clash_config}"
+  fi
+
+  # 检查并自动下载 yq 工具
+  yq="yq"
+  if ! command -v yq &>/dev/null; then
+    if [ ! -e "${box_dir}/bin/yq" ]; then
+      log Debug "未找到 yq，自动下载"
+      ${scripts_dir}/box.tool upyq
+    fi
+    yq="${box_dir}/bin/yq"
+  fi
+
+  # 补全 external-controller
+  clash_external_controller=$(busybox awk '!/^ *#/ && /external-controller: /{print $1}' "${clash_config}")
+  if [ -z "${clash_external_controller}" ]; then
+    printf "\nexternal-controller: 0.0.0.0:9090" >> "${clash_config}"
+  fi
+
+  # 补全 external-ui
+  clash_external_ui=$(busybox awk '!/^ *#/ && /external-ui: /{print $1}' "${clash_config}")
+  if [ -z "${clash_external_ui}" ]; then
+    printf "\nexternal-ui: ./dashboard" >> "${clash_config}"
+  fi
+
+  # 补全 tproxy/redir 端口
+  clash_tproxy_port=$(busybox awk '!/^ *#/ && /tproxy-port: /{print $1}' "${clash_config}")
+  if [ -z "${clash_tproxy_port}" ]; then
+    printf "\ntproxy-port: ${tproxy_port}" >> "${clash_config}"
+  fi
+  clash_redir_port=$(busybox awk '!/^ *#/ && /redir-port: /{print $1}' "${clash_config}")
+  if [ -z "${clash_redir_port}" ]; then
+    printf "\nredir-port: ${redir_port}" >> "${clash_config}"
+  fi
+
+  # 配置 Tun 模式
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    clash_tun_status=$(busybox awk '!/^ *#/ && /tun:/ { getline; split($0, arr, ": "); print arr[2]; found=1; exit } END{ if (!found) print "" }' "${clash_config}" 2>/dev/null)
+    if [ -z "${clash_tun_status}" ]; then
+      printf '%s\n' '' 'tun:' \
+        '  enable: true' \
+        '  mtu: 1500' \
+        '  device: meta' \
+        '  stack: system' \
+        '  dns-hijack:' \
+        '    - any:53' \
+        '    - tcp://any:53' \
+        '  auto-route: true' \
+        '  strict-route: true' \
+        '  auto-redirect: true' \
+        '  auto-detect-interface: true' \
+        '  include-android-user: [0, 10, 999]' \
+        '  exclude-package: []' \
+        '  include-package: []' \ >> "${clash_config}"
+      log info "已添加 Tun 配置"
+    else
+      log info "Tun 配置已存在"
+    fi
+
+    # 同步应用黑白名单到 Tun 配置
+    package=$(IFS=","; echo "${packages_list[*]}" | tr ' ' ',')
+    list_package="${package}"
+    if [[ "${proxy_mode}" = "whitelist" || "${proxy_mode}" = "white" ]]; then
+      mode="include"
+    elif [[ "${proxy_mode}" = "blacklist" || "${proxy_mode}" = "black" ]]; then
+      mode="exclude"
+    fi
+
+    include_package_found=$(busybox awk '/^tun:/{f=1} f && /'"$mode-package:"'/{print $0; exit}' "$clash_config")
+    if [ -z "$include_package_found" ]; then
+        sed -i "/^tun:/a \  $mode-package: []" "$clash_config"
+    fi
+
+    sed -i "s/exclude-package:.*/exclude-package: []/g" "${clash_config}"
+    sed -i "s/include-package:.*/include-package: []/g" "${clash_config}"
+
+    if [ -n "${list_package}" ]; then
+      list_package_clean=$(echo "$list_package" | sed 's/999://g' | sed 's/10://g' | sed 's/0://g' | busybox paste -sd, -)
+      sed -i "s/${mode}-package:.*/${mode}-package: [\"${list_package_clean//,/\",\"}\"]/g" "${clash_config}"
+    fi
+
+    sed -i "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }" "${clash_config}"
+  else
+    sed -i "/tun:/,/enable:/ { /enable: true/ s/enable: true/enable: false/ }" "${clash_config}"
+  fi
+
+  # 同步端口配置
+  sed -i -E "s/(tproxy-port: )[0-9]+/\1${tproxy_port}/" "${clash_config}"
+  sed -i -E "s/(redir-port: )[0-9]+/\1${redir_port}/" "${clash_config}"
+
+  # 补全 enhanced-mode
+  clash_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2 }' "${clash_config}" 2>/dev/null)
+  if [ -z "${clash_enhanced_mode}" ]; then
+    sed -i '/dns:/ {n; /enable:.*/ {a\  enhanced-mode: fake-ip}}' "$clash_config"
+    log Debug "已添加 enhanced-mode: fake-ip"
+  fi
+
+  # 非 Tun 模式下，fake-ip 兼容处理
+  if [[ "${network_mode}" == @(mixed|tproxy|redirect|enhance) ]]; then
+    if [[ -n "${packages_list[*]}" || -n "${ignore_out_list[*]}" || -n "${gid_list[*]}" ]] && [ "${clash_enhanced_mode}" = "fake-ip" ]; then
+      log Warning "切换 enhanced-mode 为 redir-host 以兼容代理模式"
+      sed -i "s/enhanced-mode:.*/enhanced-mode: redir-host/g" "${clash_config}"
+      sed -i "/sniffer:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }" "${clash_config}"
+    fi
+  fi
+}
+
+# 修改模块描述
+prop_description() {
+  sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ $current_time | ⚠️ ${bin_name} 配置有误，查看日志 ] /g" "$PROPFILE"
+}
+
+# 启动核心程序
+box_run_bin() {
+  log info "客户端列表: [ ${bin_list[*]} ]"
+  log info "选择: ${bin_name}，启动服务"
+  ulimit -SHn 1000000
+  case "${bin_name}" in
+    clash)
+      prepare_clash
+      if ${bin_path} -t -d "${box_dir}/${bin_name}" -f "${clash_config}" > "${box_run}/${bin_name}.log" 2>&1; then
+        nohup busybox setuidgid "${box_user_group}" "${bin_path}" -d "${box_dir}/${bin_name}" -f "${clash_config}" > "${bin_log}" 2>&1 &
+        PID=$!
+        echo -n $PID > "${box_pid}"
+        sleep 1
+      else
+        prop_description
+        log Error "$(<"${box_run}/${bin_name}.log")"
+        log Error "配置失败，检查日志"
+        exit 1
+      fi
+      ;;
+    *)
+      log Error "未知内核: [ ${bin_name} ]"
+      exit 1
+      ;;
+  esac
+}
+
+# 启用 cgroup 配置
+box_cgroup() {
+  set_cgroup_config() {
+    local cgroup_attr="$1"
+    local cgroup_value="$2"
+    if [ "${cgroup_value}" = "true" ]; then
+      if ${scripts_dir}/box.tool "${cgroup_attr}"; then
+        true
+      else
+        log Warning "启用 ${cgroup_attr} 失败，已关闭"
+        sed -i -E "/cgroup_${cgroup_attr}/ s/(true)/false/" "${settings}"
+      fi
+    fi
+  }
+  set_cgroup_config "memcg" "${cgroup_memcg}"
+  set_cgroup_config "cpuset" "${cgroup_cpuset}"
+  set_cgroup_config "blkio" "${cgroup_blkio}"
+}
+
+# 显示服务运行状态
+box_bin_status() {
+  local PID=$(busybox pidof ${bin_name})
+  if [ -z "$PID" ]; then
+    log Error "${bin_name} 未运行"
+    return 1
+  fi
+
+  stack=$(busybox awk '!/^ *#/ && /stack: / { print $2;found=1; exit}' "${clash_config}")
+  TOAST=1 log info "${bin_name} 服务正在运行"
+  log info "代理模式: ${proxy_mode} + 网络模式: ${network_mode} $(if [[ "${network_mode}" == @(mixed|tun) ]]; then echo "+ 堆栈: ${stack}"; fi)"
+
+  # 内存使用情况
+  rss=$(grep VmRSS /proc/$PID/status | busybox awk '{ print $2 }')
+  [ "${rss}" -ge 1024 ] && bin_rss="$(expr ${rss} / 1024) MB" || bin_rss="${rss} KB"
+  swap=$(grep VmSwap /proc/$PID/status | busybox awk '{ print $2 }')
+  [ "${swap}" -ge 1024 ] && bin_swap="$(expr ${swap} / 1024) MB" || bin_swap="${swap} KB"
+
+  # 进程状态和用户组
+  state=$(grep State /proc/$PID/status | busybox awk '{ print $2" "$3 }')
+  user_group=$(stat -c %U:%G /proc/$PID)
+
+  log info "运行用户组: '${user_group}'"
+  log info "状态: ${state} (PID: $PID)"
+  log info "内存使用: ${bin_rss}, 交换区: ${bin_swap}"
+
+  # CPU 使用情况
+  cpu=$(ps -p $PID -o %cpu | busybox awk 'NR==2{print $1}' 2>/dev/null)
+  cpus_allowed=$(grep Cpus_allowed_list /proc/$PID/status | busybox awk '{ print $2" "$3 }')
+  core=$(busybox awk '{print $39}' /proc/$PID/stat 2>/dev/null)
+
+  [ -n "${cpu}" ] && log info "CPU 使用率: ${cpu}%" || log info "CPU 使用率: 不可用"
+  [ -n "${cpus_allowed}" ] && {
+    log info "允许 CPU 列表: ${cpus_allowed}"
+    log info "最后运行核心: ${core}"
+  } || log info "CPU 信息: 不可用"
+
+  # 电池温度
+  temperature_celsius=$(($(cat /sys/class/power_supply/battery/temp) / 10))
+  log info "电池温度: ${temperature_celsius}°C"
+
+  # 运行时间
+  running_time=$(busybox ps -o comm,etime | grep ${bin_name} | busybox awk '{print $2}')
+  [ -n "${running_time}" ] && log info "运行时间: ${running_time}" || log info "运行时间: 不可用"
+
+  # 本地 IP 和 DNS
+  localIP=($(ip -4 a | awk '/inet / && !/127.0.0.1/ { split($2, a, "/"); print a[1] }'))
+  log info "本地 IP: ${localIP[*]}"
+  localDNS=($(dumpsys connectivity | awk -F'[ ,]' '/DnsAddresses:/ { for (i=1; i<=NF; i++) if ($i ~ /^\/.*$/) print substr($i, 2) }' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u))
+  log info "本地 DNS: ${localDNS[*]}"
+
+  # 更新模块描述和 PID 文件
+  if [ -n "$PID" ]; then
+    sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ $current_time | ⭕ ${bin_name} 服务运行中 ] /g" "$PROPFILE"
+    echo -n "$PID" > "${box_pid}"
+  fi
+}
+
+# 启动服务主流程
+start_box() {
+  sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ $current_time | ⚠️ 模块工作中，无服务运行 ] /g" "$PROPFILE"
+  echo -n "" > "${box_log}"
+
+  # 输出系统和模块信息
+  box_version=$(busybox awk '!/^ *#/ && /version=/ { print $0 }' "/data/adb/modules/ClashForRoot/module.prop" 2>/dev/null)
+  if [ -t 1 ]; then
+    echo "$(getprop persist.sys.timezone) $(date)"
+    echo "$(getprop gsm.sim.operator.alpha) $(getprop gsm.network.type)"
+    echo "${box_version}($(getprop ro.product.cpu.abi))"
+    echo "━━━━━━━━━━━━━━━━━━"
+  else
+    {
+      echo "$(getprop persist.sys.timezone) $(date)"
+      echo "$(getprop gsm.sim.operator.alpha) $(getprop gsm.network.type)"
+      echo "${box_version}($(getprop ro.product.cpu.abi))"
+      echo "━━━━━━━━━━━━━━━━━━"
+    } | tee -a "${box_log}" >/dev/null 2>&1
+  fi
+
+  # 检查是否已有运行实例，有则重启
+  PIDS=("${bin_list[@]}")
+  PID=""
+  i=0
+  while [ -z "$PID" ] && [ "$i" -lt "${#PIDS[@]}" ]; do
+    PID=$(busybox pidof "${PIDS[$i]}")
+    i=$((i+1))
+  done
+  if [ -n "$PID" ]; then
+    pid_name="${box_dir}/run/pid_name.txt"
+    ps -p $PID -o comm= > "${pid_name}"
+    sed -i '/^[[:space:]]*$/d' "${pid_name}"
+    log Debug "$(<"${pid_name}")(PID: $PID) 已运行，自动重启"
+    rm -f "${pid_name}"
+    stop_box
+    start_box && "${scripts_dir}/box.iptables" renew
+    exit 1
+  fi
+
+  # 校验内核类型并设置
+  case "${bin_name}" in
+    clash)
+      log info "你好"
+      [ "${bin_name}" = "clash" ] && {
+        xclash || exit 1
+      }
+      ;;
+    *)
+      log Error "未定义内核: [ ${bin_name} ]"
+      exit 1
+      ;;
+  esac
+
+  # 检查 busybox 版本
+  busybox_code=$(busybox | busybox grep -oE '[0-9.]*' | head -n 1)
+  if [ "$(echo "${busybox_code}" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" -lt "$(echo "1.36.1" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" ]; then
+    log info "当前 busybox v${busybox_code}"
+    log Warning "请更新到 v1.36.1+"
+  else
+    log info "当前 busybox v${busybox_code}"
+  fi
+
+  # 执行前置检查和初始化
+  box_permission
+  box_check_bin
+  box_check_logs
+  [ "${run_crontab}" = "true" ] && box_run_crontab || log info "crontab 已禁用"
+
+  # 补全代理模式（未配置则设为 white）
+  if [ -z "${proxy_mode}" ]; then
+    M1=$(busybox awk '!/^ *#/ && /mode:/{print $0}' "${pkg_config}")
+    [ -z $M1 ] && printf "\nmode:white" >> "${pkg_config}"
+    log Debug "已添加代理模式: white"
+  fi
+
+  # 启动核心并检查状态
+  box_run_bin
+  box_cgroup
+  count=0
+  while [ $count -le 10 ]; do
+    sleep 0.17
+    box_bin_alive || break
+    count=$((count + 1))
+  done
+  box_bin_status
+  true
+}
+
+# 停止服务
+stop_box() {
+  stop_cron
+  # 终止所有核心进程
+  for bin in "${bin_list[@]}"; do
+    if busybox pgrep "${bin}" >/dev/null; then
+      if busybox pkill -15 "${bin}" >/dev/null; then
+        :
+      else
+        killall -15 "${bin}" >/dev/null || kill -15 "$(busybox pidof "${bin}")" >/dev/null 2>&1
+      fi
+    fi
+  done
+
+  # 检查是否停止成功
+  sleep 0.5
+  if ! busybox pidof "${bin_name}" >/dev/null; then
+    [ -f "${box_pid}" ] && rm -f "${box_pid}"
+    log info "${bin_name} 已停止"
+    TOAST=1 log info "${bin_name} 已断开连接"
+    [ -t 1 ] && echo "━━━━━━━━━━━━━━━━━━"
+  else
+    log Warning "${bin_name} 停止失败，尝试强制关闭"
+    force_stop
+  fi
+
+  sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ $current_time | ❌ ${bin_name} 已停止 ] /g" "$PROPFILE"
+}
+
+# 停止定时任务
+stop_cron() {
+if ! busybox pkill -f "busybox crond" >/dev/null; then
+  cronkill=$(busybox pgrep -f "crond -c ${box_run}")
+  for cron in ${cronkill[@]}; do
+    kill -15 "${cron}" >/dev/null 2>&1
+  done
+fi
+}
+
+# 强制终止服务
+force_stop() {
+  log Warning "强制关闭中..."
+  for bin in "${bin_list[@]}"; do
+    if busybox pkill -9 "${bin}"; then
+      :
+    else
+      if command -v killall >/dev/null; then
+        killall -9 "${bin}" >/dev/null || true
+      else
+        pkill -9 "${bin}" >/dev/null || true
+      fi
+    fi
+  done
+  sleep 0.5
+  if ! busybox pidof "${bin_name}" >/dev/null; then
+    log Warning "强制关闭完成"
+    rm -f "${box_pid}"
+  fi
+}
+
+# 检查 busybox 是否存在
+if ! command -v busybox &> /dev/null; then
+  log Error "未找到 busybox 命令"
+  exit 1
+fi
+
+# 生成 webroot 页面
+if command -v ksud &>/dev/null; then
+ $scripts_dir/box.tool webroot >/dev/null 2>&1
+fi
+
+# 命令行参数处理
+case "$1" in
+  start)
+    stop_box >/dev/null 2>&1
+    start_box
+    ;;
+  stop)
+    stop_box
+    ;;
+  restart)
+    "${scripts_dir}/box.iptables" disable && stop_box
+    sleep 0.5
+    start_box && "${scripts_dir}/box.iptables" renew
+    ;;
+  status)
+    if busybox pidof "${bin_name}" >/dev/null; then
+      echo "$("${bin_path}" -v)"
+      box_bin_status
+    else
+      log Warning "${bin_name} 已停止"
+    fi
+    ;;
+  cron)
+    run_crontab="true"
+    stop_cron
+    sleep 0.5
+    box_run_crontab
+    ;;
+  kcron)
+    stop_cron
+    ;;
+  help|-h|--help|"")
+    echo "使用方法: $0 {start|stop|restart|status|cron|kcron}"
+    echo
+    echo "命令:"
+    echo "  start    - 启停服务 start    - 启停服务（已运行则先停止）"
+    echo "  stop     - 停止服务"
+    echo "  restart  - 重启服务并刷新 iptables"
+    echo "  status   - 显示服务状态和版本"
+    echo "  cron     - 启用定时任务"
+    echo "  kcron    - 禁用定时任务"
+    echo
+    echo "示例:"
+    echo "  $0 start"
+    ;;
+  *)
+    echo "$0 $1 未找到"
+    echo "运行 '$0 help' 查看用法"
+    ;;
+esac

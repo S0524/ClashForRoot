@@ -1,0 +1,27 @@
+#!/system/bin/sh
+
+# 获取当前连接的WiFi名称
+get_current_ssid() {
+  SSID=$(cmd wifi status 2>/dev/null | sed -n 's/.*SSID: "\([^"]*\)".*/\1/p' | head -n1)
+  [ -z "$SSID" ] || [ "$SSID" = "<unknown ssid>" ] && {
+    SSID=$(iwconfig wlan0 2>/dev/null | grep 'ESSID' | busybox awk -F ':' '{print $2}' | tr -d '"')
+    [ -z "$SSID" ] || [ "$SSID" = "off/any" ] && SSID="unknown"
+  }
+  echo "$SSID"
+}
+
+# 检查WiFi是否已连接
+is_wifi_connected() {
+  if dumpsys wifi | grep -q 'Wi-Fi is enabled' && ip addr show wlan0 | grep -q 'inet '; then
+    echo "wifi"
+  else
+    echo "not_wifi"
+  fi
+}
+
+# 检查当前WiFi是否在允许列表
+is_allowed_wifi() {
+  local ssid=$(echo "$1" | xargs)
+  local allowed_ssids=$(IFS=,; echo "${wifi_ssids_list[*]}" | sed 's/,/|/g')
+  echo "$ssid" | grep -qE "^($allowed_ssids)$"
+}
