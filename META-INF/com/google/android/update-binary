@@ -1,0 +1,32 @@
+#!/sbin/sh
+
+# 设置文件权限掩码
+umask 022
+
+# 定义界面打印函数
+ui_print() { echo "$1"; }
+
+# 检查Magisk版本要求的函数
+require_new_magisk() {
+  ui_print "请安装Magiskv20.4+"
+  exit 1
+}
+
+# 获取输出文件描述符和ZIP文件路径参数
+OUTFD=$2
+ZIPFILE=$3
+
+# 挂载/data分区
+mount /data 2>/dev/null
+
+# 检查是否存在Magisk工具函数库文件
+[ -f /data/adb/magisk/util_functions.sh ] && {
+    # 加载工具函数库
+    . /data/adb/magisk/util_functions.sh
+    # 检查Magisk版本是否低于20400（即v20.4）
+    [ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk
+    # 安装模块
+    install_module
+    # 正常退出
+    exit 0
+}
