@@ -1,0 +1,75 @@
+#!/system/bin/sh
+
+# 检查设备是否有 root 权限
+if ! su -c 'echo root' &>/dev/null; then
+    echo -e "错误: 设备没有 root 权限"
+    exit 1
+fi
+
+# 帮助函数
+help() {
+    echo -e "使用方法: $0 {start|stop|s <参数>|i <参数>|u|x|r|t <参数>}\n"
+    echo -e "start    : 启动 Box (启动服务和 iptables)"
+    echo -e "stop     : 停止 Box (停止 iptables 和服务)"
+    echo -e "s <参数> : 运行 box.service 命令并传递额外参数"
+    echo -e "i <参数> : 运行 box.iptables 命令并传递额外参数"
+    echo -e "t <参数> : 运行 box.tool 工具并传递额外参数"
+    echo -e "u        : API 升级核心[clash] (向 /upgrade 发送 POST 请求)"
+    echo -e "x        : API 升级仪表板 UI [clash] (向 /upgrade/ui 发送 POST 请求)"
+    echo -e "r        : API 重启 Box[clash] (向 /restart 发送 POST 请求)"
+    echo -e "help     : 显示此帮助信息"
+}
+
+# 向本地 Box UI 端点发送 POST 请求的函数
+post_ui() {
+    local endpoint="$1"
+    curl -s -X POST "http://127.0.0.1:9090$endpoint" \
+        && echo -e "成功向 $endpoint 发送 POST 请求" \
+        || echo -e "向 $endpoint 发送 POST 请求失败"
+}
+
+# 参数处理
+case "$1" in
+    start)
+        echo -e "正在启动Box"
+        su -c '/data/adb/clash/scripts/box.service start'
+        su -c '/data/adb/clash/scripts/box.iptables enable'
+        ;;
+    stop)
+        echo -e "正在停止Box"
+        su -c '/data/adb/clash/scripts/box.iptables disable'
+        su -c '/data/adb/clash/scripts/box.service stop'
+        ;;
+    s)
+        # 执行 box.service 命令
+        su -c "/data/adb/clash/scripts/box.service ${2}"
+        ;;
+    i)
+        # 执行 box.iptables 命令
+        su -c "/data/adb/clash/scripts/box.iptables ${2}"
+        ;;
+    u)
+        # 升级核心
+        post_ui "/upgrade"
+        ;;
+    x)
+        # 升级仪表板 UI
+        post_ui "/upgrade/ui"
+        ;;
+    r)
+        # 重启 Box
+        post_ui "/restart"
+        ;;
+    t)
+        # 执行 box.tool 工具命令
+        su -c "/data/adb/clash/scripts/box.tool $2"
+        ;;
+    help|-h|--help)
+        help
+        ;;
+    *)
+        echo -e "未知参数: $1"
+        help
+        exit 1
+        ;;
+esac
